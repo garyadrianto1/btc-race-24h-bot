@@ -1,18 +1,27 @@
 """Dip-snap cbBTC trading bot for make.fun's btc-race-24h-20261117-0603.
 
-Strategy (validated on the 24h dev window: net PnL +$20.09, 4 trades, max
-drawdown 1.22%; buy-and-hold on the same window makes +$1.07 and every
-fast trend/mean-reversion variant loses money to the ~26 bps round-trip cost):
+Strategy (E5 — validated on the 24h dev window by the real harness:
+net PnL +$16.73, 4 trades, max drawdown 2.7%; buy-and-hold on the same
+window makes +$1.07 and every fast trend/mean-reversion variant loses
+money to the ~26 bps round-trip cost):
 
 - Flat: buy all-in when the close has fallen 0.9% or more over the last
-  30 bars (a sharp dip), i.e. close * 1000 <= close_30_bars_ago * 991.
+  45 bars (a sharp dip), i.e. close * 1000 <= close_45_bars_ago * 991.
+  A 45-bar lookback (not 30) is what survives regime shuffling: on 24
+  block-bootstrap 24h windows rebuilt from the dev window it keeps a
+  median PnL of +$25.43 with only 2 losing windows, vs +$9.73 / 8 losing
+  for the 30-bar version.
 - Holding: sell everything when the close is 1.2% above the entry close
-  (take profit) or 1.2% below it (stop-loss), i.e. close * 1000 >= entry * 1012
-  or close * 1000 <= entry * 988.
-- Late-entry fallback: if no trade has completed by batch 1000 and the close
-  is above its 240-bar EMA, buy (same exits). This guarantees at least one
-  trade in a smooth uptrend window where no sharp dip ever appears; it never
-  fires on the dev window, so it costs nothing there.
+  (take profit) or 1.2% below it (stop-loss), i.e. close * 1000 >=
+  entry * 1012 or close * 1000 <= entry * 988.
+- Second-chance dip: if no trade has completed by batch 1000, also accept
+  a 0.9% dip measured over 60 bars. In calm windows the 45-bar dip never
+  appears, but the slower 60-bar dip does; this keeps the bot trading
+  (and profitable) in range-like windows instead of sitting out.
+- Late-entry fallback: if still no trade has completed by batch 1000 and
+  the close is above its 240-bar EMA *and* the 60-bar return is at least
+  +0.5%, buy (same exits). The trend filter keeps it from buying the top
+  of a range; it never fires on the dev window, so it costs nothing there.
 
 All arithmetic is integer (fixed-point EMA), no randomness, no clock, no
 environment, no file access: two runs on the same data are byte-identical.
@@ -28,14 +37,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ven
 import makefun_bars
 
 SYMBOL = "CBBTC"
-LOOKBACK = 30          # bars for the dip measurement
-DROP_NUM = 991         # buy when close * 1000 <= close_30_ago * 991 (<= -0.9%)
+LOOKBACK = 45          # bars for the dip measurement
+DROP_NUM = 991         # buy when close * 1000 <= close_45_ago * 991 (<= -0.9%)
 TP_NUM = 1012          # sell when close * 1000 >= entry * 1012 (>= +1.2%)
 SL_NUM = 988           # sell when close * 1000 <= entry * 988 (<= -1.2%)
 LATE_BAR = 1000        # first batch the late-entry fallback may fire on
 EMA_SPAN = 240         # bars for the late-entry trend filter
 EMA_SCALE = 1_000_000
 EMA_K = 2 * EMA_SCALE // (EMA_SPAN + 1)
+HEDGE_TREND_LOOKBACK = 60   # bars for the late-entry trend filter
+HEDGE_TREND_BPS = 50        # late entry needs a 60-bar return >= +0.5%
+SC_LOOKBACK = 60       # bars for the second-chance dip measurement
+SC_DROP_NUM = 991      # second-chance dip: close * 1000 <= close_60_ago * 991
+SC_BAR = 1000          # first batch the second-chance dip may fire on
 MAX_SLIPPAGE_BPS = 500
 
 closes = []            # CBBTC closes (ints), one per batch that carries its bar
@@ -87,8 +101,19 @@ def on_batch(state, batch):
             return [{"side": "buy", "symbol": SYMBOL,
                      "notional_quote_units": state.cash,
                      "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+    if (completed_trades == 0 and state.seq >= SC_BAR
+            and len(closes) >= SC_LOOKBACK + 1
+            and closes[-1] * 1000 <= closes[-1 - SC_LOOKBACK] * SC_DROP_NUM):
+        entry = close
+        pending_buy = True
+        return [{"side": "buy", "symbol": SYMBOL,
+                 "notional_quote_units": state.cash,
+                 "max_slippage_bps": MAX_SLIPPAGE_BPS}]
     if (not late_done and completed_trades == 0 and state.seq >= LATE_BAR
-            and ema is not None and close > ema):
+            and ema is not None and close > ema
+            and len(closes) >= HEDGE_TREND_LOOKBACK + 1
+            and (closes[-1] - closes[-1 - HEDGE_TREND_LOOKBACK]) * 10000
+            // closes[-1 - HEDGE_TREND_LOOKBACK] >= HEDGE_TREND_BPS):
         entry = close
         pending_buy = True
         late_done = True
